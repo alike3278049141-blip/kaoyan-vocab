@@ -98,16 +98,48 @@ def today(): return dt.date.today().isoformat()
 def add_days(s, n): return (dt.date.fromisoformat(s) + dt.timedelta(days=n)).isoformat()
 
 DB = {"days": {}, "progress": {}}
+def normalize_word(d, tag_default="文章"):
+    """把各种格式的词条统一成 {w,pos,cn,ex,tag}；无法识别返回 None"""
+    if isinstance(d, str):
+        return {"w": d.strip(), "pos": "", "cn": "", "ex": "", "tag": tag_default}
+    if not isinstance(d, dict):
+        return None
+    w = d.get("w") or d.get("word") or d.get("term") or d.get("en") or d.get("headword")
+    if not w or not str(w).strip():
+        return None
+    cn = (d.get("cn") or d.get("meaning") or d.get("def") or d.get("gloss")
+          or d.get("translation") or "")
+    ex = (d.get("ex") or d.get("example") or d.get("sentence") or d.get("context") or "")
+    tag = (d.get("tag") or d.get("source") or d.get("type") or tag_default)
+    return {"w": str(w).strip(), "pos": str(d.get("pos", "") or ""),
+            "cn": str(cn), "ex": str(ex), "tag": str(tag)}
 
+def normalize_day(day, data):
+    """把一天的词单规范为 {"date","title","words":[...]}，坏词条自动剔除"""
+    words = data.get("words", []) if isinstance(data, dict) else []
+    fixed, seen = [], set()
+    for x in words:
+        nw = normalize_word(x)
+        if nw and nw["w"].lower() not in seen:
+            seen.add(nw["w"].lower()); fixed.append(nw)
+    if not fixed:
+        return None
+    return {"date": day, "title": data.get("title", "") if isinstance(data, dict) else "",
+            "words": fixed}
 def load_db():
     try:
         with open(DATA_FILE, encoding="utf-8") as f:
             data = json.load(f)
-        DB["days"] = data.get("days", {})
-        DB["progress"] = data.get("progress", {})
     except Exception:
-        pass
+        data = {}
+    if isinstance(data, dict):
+        for day, d in (data.get("days") or {}).items():
+            nd = normalize_day(day, d)
+            if nd:
+                DB["days"][day] = nd
+        DB["progress"] = data.get("progress") or {}
     DB["days"].setdefault(SEED["date"], SEED)
+    save_db()   # 把修复后的干净数据写回，以后启动不再反复清洗
 
 def save_db():
     os.makedirs(APP_DIR, exist_ok=True)
@@ -120,8 +152,9 @@ def st(key):
 def all_words():
     out = []
     for day, data in DB["days"].items():
-        for w in data["words"]:
-            out.append({"day": day, "w": w, "key": day + "::" + w["w"]})
+        for w in data.get("words", []):
+            if isinstance(w, dict) and w.get("w"):
+                out.append({"day": day, "w": w, "key": day + "::" + w["w"]})
     return out
 
 def due_words():
@@ -675,18 +708,24 @@ class App(tk.Tk):
         ttk.Button(row, text="清空学习进度", command=self.do_reset).pack(side="left")
         ttk.Label(f, text=f"数据文件：{DATA_FILE}", foreground="#6b7280").pack(anchor="w", padx=14, pady=(0, 10))
 
-    def do_import(self):
+        def do_import(self):
         raw = self.data_text.get("1.0", "end").strip()
         if not raw:
             messagebox.showwarning("提示", "请先粘贴 JSON 内容"); return
         try:
             obj = json.loads(raw)
-            if "days" in obj:
-                DB["days"].update(obj["days"]); DB["progress"].update(obj.get("progress", {}))
-            elif "date" in obj and "words" in obj:
-                DB["days"][obj["date"]] = {"date": obj["date"],
-                                           "title": obj.get("title", "Day " + obj["date"]),
-                                           "words": obj["words"]}
+            if isinstance(obj, dict) and "days" in obj:          # 完整备份格式
+                for day, d in obj["days"].items():
+                    nd = normalize_day(day, d)
+                    if nd: DB["days"][day] = nd
+                DB["progress"].update(obj.get("progress") or {})
+            elif isinstance(obj, dict) and "words" in obj:       # 单日词单格式
+                day = str(obj.get("date") or today())
+                nd = normalize_day(day, obj)
+                if not nd:
+                    raise ValueError("words 里没有可识别的词条（每条需含 w/word 字段）")
+                DB["days"][day] = {"date": day, "title": obj.get("title", "Day " + day),
+                                   "words": nd["words"]}
             else:
                 raise ValueError("需要 {date,title,words} 或完整备份数据")
             save_db(); messagebox.showinfo("成功", "导入成功！今日计划已更新")
